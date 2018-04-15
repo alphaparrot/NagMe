@@ -28,6 +28,16 @@ CLIENT_SECRET_FILE = 'client_secret.json'
 #APPLICATION_NAME = 'Google Calendar API Python Quickstart'
 APPLICATION_NAME = 'NagMe'
 
+class Profile:
+    def __init__(self,username,nagcal):
+        self.name=username
+        self.mycal = nagcal
+        self.tasks=[]
+        self.scals=[]
+    def save(self):
+        pickle.dump(self,open("."+self.name,"wb"),1)
+
+
 def initCalendar(user=None):
     creds = nd.get_credentials(user=user)
     http = creds.authorize(httplib2.Http())
@@ -80,8 +90,12 @@ def cli():
     for nc in cals:
         if nc["id"]==nagcal["id"]:
             cals.remove(nc)
-    scals = []
-    tasks = []
+    
+    try:
+        userprof = pickle.load(open("."+user,"rb"))
+    except:
+        userprof = Profile(user,nagcal)
+    
     while True:
         print("\nEnter one of the following commands:\n\n"+
               "l : List all available calendars \n"+
@@ -93,13 +107,15 @@ def cli():
         command = raw_input("Command: ")
         
         if command=="c":
-            listscals(scals)
+            listscals(userprof.scals)
         elif command=="l":
             listcals(cals)
         elif command=="s":
-            selectcals(scals,cals)
+            userprof.scals=selectcals(userprof.scals,cals)
+            userprof.save()
         elif command=="a":
-            tasks.append(addtask(scals,nagcal,user))
+            userprof.tasks.append(addtask(userprof.scals,nagcal,user))
+            userprof.save()
         elif command=="u":
             user = raw_input("Enter username: ")
             fu = open(".user","wb")
@@ -113,9 +129,11 @@ def cli():
             for nc in cals:
                 if nc["id"]==nagcal["id"]:
                     cals.remove(nc)
-            scals = []
-            tasks = []
             print("\nWelcome, "+user)
+            try:
+                userprof = pickle.load(open("."+user,"rb"))
+            except:
+                userprof = Profile(user,nagcal)
         elif command=="q":
             break
         else:
