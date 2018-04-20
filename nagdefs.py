@@ -10,7 +10,7 @@ from oauth2client.file import Storage
 
 import datetime
 
-import glob,pickle,random
+import glob,pickle,random,sys
 
 try:
     import argparse
@@ -23,6 +23,115 @@ except ImportError:
 SCOPES = 'https://www.googleapis.com/auth/calendar'
 CLIENT_SECRET_FILE = 'client_secret.json'
 APPLICATION_NAME = 'NagMe'
+
+
+def initCalendar(user=None):
+    creds = get_credentials(user=user)
+    http = creds.authorize(httplib2.Http())
+    serv = discovery.build('calendar','v3',http=http)
+    cal1 = serv.calendars().insert(body={"summary":"NagMe",
+                                         "description":("Timely and responsible reminders "+
+                                                             "to do those pesky tasks you'd "+
+                                                             "otherwise let slide, like sending "+
+                                                             "that email, making that appointment, "+
+                                                             "or writing that application.")}).execute()
+    newcal = serv.calendarList().insert(body={"defaultReminders": [{"minutes": 0,
+                                                                    "method": "popup"},],
+                                              "selected":True,
+                                              "id":cal1['id']}).execute()
+    fc=open(".nagme_calendar_"+user,"wb")
+    pickle.dump(newcal,fc,1)
+    fc.close()
+    return newcal
+
+def getCalendar(user=None):
+    try:
+        fc=open(".nagme_calendar_"+user,"rb")
+        cal = pickle.load(fc)
+        fc.close()
+    except:
+        print("Can't seem to open calendar file; creating a new one.")
+        cal = initCalendar(user=user)
+    return cal
+
+
+class Profile:
+    def __init__(self,username,nagcal):
+        self.name=username
+        self.mycal = nagcal
+        self.tasks=[]
+        self.scals=[]
+        self.activated=False
+    def save(self):
+        pickle.dump(self,open("."+self.name,"wb"),1)
+
+def startdaemon(daily=True):
+    if sys.platform.startswith('linux'):
+        if daily:
+            #nsf = open("nagshell","r")
+            #ns = nsf.read().split('\n')
+            #nsf.close()
+            #ns[4] = ns[4].split()
+            #ns[4][3] = "today"
+            #ns[4] = ' '.join(ns[4])
+            #ns = '\n'.join(ns)
+            #nsf = open("nagshell","w")
+            #nsf.write(ns)
+            #nsf.close()
+            
+            nsf = open("nagdaemon.py","r")
+            ns = nsf.read().split('\n')
+            nsf.close()
+            ns[0]="today=True"
+            ns[1]="thisweek=False"
+            ns = '\n'.join(ns)
+            nsf = open("nagdaemon.py","w")
+            nsf.write(ns)
+            nsf.close()
+            
+            os.system("gksudo cp nagshell /etc/cron.daily/nagshell")
+        else:
+            #nsf = open("nagshell","r")
+            #ns = nsf.read().split('\n')
+            #nsf.close()
+            #ns[4] = ns[4].split()
+            #ns[4][3] = "week"
+            #ns[4] = ' '.join(ns[4])
+            #ns = '\n'.join(ns)
+            #nsf = open("nagshell","w")
+            #nsf.write(ns)
+            #nsf.close()  
+            
+            nsf = open("nagdaemon.py","r")
+            ns = nsf.read().split('\n')
+            nsf.close()
+            ns[0]="today=False"
+            ns[1]="thisweek=True"
+            ns = '\n'.join(ns)
+            nsf = open("nagdaemon.py","w")
+            nsf.write(ns)
+            nsf.close()
+            
+            os.system("gksudo cp nagshell /etc/cron.weekly/nagshell")
+            
+    elif sys.platform.startswith('darwin'):
+        print("OS X not yet supported. Womp womp.")
+    else:
+        print("Automatic scheduling not yet supported on this OS. Womp womp.")
+        
+def stopdaemon():
+    if sys.platform.startswith('linux'):
+        daily = os.path.isfile("/etc/cron.daily/nagshell")
+        if daily:
+            os.system("gksudo rm /etc/cron.daily/nagshell")
+        weekly = os.path.isfile("/etc/cron.weekly/nagshell")
+        if weekly:
+            os.system("gksudo rm /etc/cron.weekly/nagshell")
+    elif sys.platform.startswith('darwin'):
+        print("OS X not  yet supported. Womp womp.")
+    else:
+        print("Automatic scheduling not yet supported on this OS. Womp womp.")
+    
 
 class Task:
     def __init__(self,name,deadline,advance_notice,workweek=True,weekend=False,workday=True,
@@ -64,58 +173,158 @@ class Task:
     #We'll also have to keep track of how many have been done for that week. Not sure how best to do
     #that.
         
-        self.reminders = []
         self.calendar = Calendar(self.firstday,self.deadline,cals=cals,user=self.user)
+        self.reminders = []
+        for w in self.calendar.weeks:
+            self.reminders.append([])
         self.event=self.reminder(self.deadline)
+        
+    def markdone(self):
+        credentials = get_credentials(user=self.user)
+        http = credentials.authorize(httplib2.Http())
+        serv = discovery.build('calendar', 'v3', http=http) 
+        for w in self.reminders:
+            for r in w:
+                try:
+                    serv.events().delete(calendarId=self.calendarId,eventId=r[1]['id']).execute()
+                except:
+                    print("Deletion error for event ",r[1]['summary'])
+        try:
+            serv.events().delete(calendarId=self.calendarId,eventId=self.event[1]['id']).execute()
+        except:
+            print("Deletion error for event ",self.event[1]["summary"])
     
-    def assign(self,today=False,thisweek=False): #Default is to schedule ALL the reminders
+    def assign(self,today=False,thisweek=False,progressbar=None,proginc=1.0): #Default is to schedule ALL the reminders
         if today: #nuance needed: if we've already met the quota of reminders for the week, stop.
             now = datetime.datetime.now()
+            if now<self.firstday:
+                return False
             if now.weekday > 4 and self.timeframe<10: #Weekdays only, and it's a weekend
                 return False
             elif now.weekday <=4 and (self.timeframe%10)==0: #Weekends only, and it's a weekday
                 return False
             else:
                 ntoday = self.calendar.whatdayisit(now)
-                nsofar = 0
-                while nsofar<self.frequency:
-                    if (self.timeofday%2)==0: #Not during the day
-                        morn=False
-                        even=False
-                        if (self.timeofday%100)==30: #Morning
-                            start = datetime.datetime(now.year,now.month,now.day,7,0,0)
-                            end = datetime.datetime(now.year,now.month,now.day,9,0,0)
-                            morning=(start,end)
-                            trange = morning
-                            morn=True
-                        if self.timeofday>=100: #Evening
-                            start = datetime.datetime(now.year,now.month,now.day,18,0,0)
-                            end = datetime.datetime(now.year,now.month,now.day,23,0,0)
-                            evening=(start,end)
-                            trange=evening
+                kweek = self.calendar.whatweekisit(now)
+                if self.frequency>=1:
+                    nsofar = 0
+                    while nsofar<self.frequency:
+                        if (self.timeofday%2)==0: #Not during the day
+                            morn=False
                             even=False
-                        if morn and even:
-                            trange = random.choice((morn,even))
-                    else:
-                        end = datetime.datetime(now.year,now.month,now.day,17,0,0)
-                        start = datetime.datetime(now.year,now.month,now.day,10,0,0)
-                        if self.timeofday>=100: #Evening
-                            end = datetime.datetime(now.year,now.month,now.day,23,0,0)
-                        if (self.timeofday%100)>=30: #morning
-                            start = datetime.datetime(now.year,now.month,now.day,7,0,0)
-                        trange = (start,end)
-                    if trange[0]>=self.deadline:
-                        break
-                    timeslot=datetime.datetime(2999,1,1,0,0,0)
-                    while timeslot>=self.deadline:
-                        timeslot,err = self.calendar.propose(ntoday,tmin=trange[0],tmax=trange[1])
-                    self.reminders.append(self.reminder(timeslot))
-                    nsofar+=1
-                    if self.frequency-nsofar<1:
-                        flip = random.random()
-                        if flip>(self.frequency-nsofar):
+                            if (self.timeofday%100)==30: #Morning
+                                start = datetime.datetime(now.year,now.month,now.day,7,0,0)
+                                end = datetime.datetime(now.year,now.month,now.day,9,0,0)
+                                morning=(start,end)
+                                trange = morning
+                                morn=True
+                            if self.timeofday>=100: #Evening
+                                start = datetime.datetime(now.year,now.month,now.day,18,0,0)
+                                end = datetime.datetime(now.year,now.month,now.day,23,0,0)
+                                evening=(start,end)
+                                trange=evening
+                                even=True
+                            if morn and even:
+                                trange = random.choice((morn,even))
+                        else:
+                            end = datetime.datetime(now.year,now.month,now.day,17,0,0)
+                            start = datetime.datetime(now.year,now.month,now.day,10,0,0)
+                            if self.timeofday>=100: #Evening
+                                end = datetime.datetime(now.year,now.month,now.day,23,0,0)
+                            if (self.timeofday%100)>=30: #morning
+                                start = datetime.datetime(now.year,now.month,now.day,7,0,0)
+                            trange = (start,end)
+                        if progressbar:
+                            progressbar.step(0.5*proginc/self.frequency)
+                        if trange[0]>=self.deadline:
                             break
-                return True
+                        timeslot=datetime.datetime(2999,1,1,0,0,0)
+                        while timeslot>=self.deadline:
+                            timeslot,err = self.calendar.propose(ntoday,tmin=trange[0],tmax=trange[1])
+                        self.reminders[kweek].append(self.reminder(timeslot))
+                        if progressbar:
+                            progressbar.step(0.5*proginc/self.frequency)
+                        nsofar+=1
+                        if self.frequency-nsofar<1:
+                            flip = random.random()
+                            if flip>(self.frequency-nsofar):
+                                break
+                    return True
+                else: #We don't do it every day
+                    nsofar = len(self.reminders[kweek])
+                    if nsofar < min(self.fperweek, len(self.calendar.weeks[kweek])):  #Need more this week
+                        flip = random.random()
+                        if flip<=self.frequency:  #Figure out if today's the day
+                            if (self.timeofday%2)==0: #Not during the day
+                                morn=False
+                                even=False
+                                if (self.timeofday%100)==30: #Morning
+                                    start = datetime.datetime(now.year,now.month,now.day,7,0,0)
+                                    end = datetime.datetime(now.year,now.month,now.day,9,0,0)
+                                    morning=(start,end)
+                                    trange = morning
+                                    morn=True
+                                if self.timeofday>=100: #Evening
+                                    start = datetime.datetime(now.year,now.month,now.day,18,0,0)
+                                    end = datetime.datetime(now.year,now.month,now.day,23,0,0)
+                                    evening=(start,end)
+                                    trange=evening
+                                    even=False
+                                if morn and even:
+                                    trange = random.choice((morn,even))
+                            else:
+                                end = datetime.datetime(now.year,now.month,now.day,17,0,0)
+                                start = datetime.datetime(now.year,now.month,now.day,10,0,0)
+                                if self.timeofday>=100: #Evening
+                                    end = datetime.datetime(now.year,now.month,now.day,23,0,0)
+                                if (self.timeofday%100)>=30: #morning
+                                    start = datetime.datetime(now.year,now.month,now.day,7,0,0)
+                                trange = (start,end)
+                            if trange[0]>=self.deadline:
+                                return False
+                            timeslot=datetime.datetime(2999,1,1,0,0,0)
+                            while timeslot>=self.deadline:
+                                timeslot,err = self.calendar.propose(ntoday,tmin=trange[0],tmax=trange[1])
+                            self.reminders[kweek].append(self.reminder(timeslot))
+                            if progressbar:
+                                progressbar.step(proginc)
+                            nsofar+=1
+                        #Todo: if days left in the week <= number of reminders left, do a reminder
+                        elif self.calendar.daysleftinweek(now)<=(self.fperweek-len(self.reminders[kweek])):
+                            if (self.timeofday%2)==0: #Not during the day
+                                morn=False
+                                even=False
+                                if (self.timeofday%100)==30: #Morning
+                                    start = datetime.datetime(now.year,now.month,now.day,7,0,0)
+                                    end = datetime.datetime(now.year,now.month,now.day,9,0,0)
+                                    morning=(start,end)
+                                    trange = morning
+                                    morn=True
+                                if self.timeofday>=100: #Evening
+                                    start = datetime.datetime(now.year,now.month,now.day,18,0,0)
+                                    end = datetime.datetime(now.year,now.month,now.day,23,0,0)
+                                    evening=(start,end)
+                                    trange=evening
+                                    even=False
+                                if morn and even:
+                                    trange = random.choice((morn,even))
+                            else:
+                                end = datetime.datetime(now.year,now.month,now.day,17,0,0)
+                                start = datetime.datetime(now.year,now.month,now.day,10,0,0)
+                                if self.timeofday>=100: #Evening
+                                    end = datetime.datetime(now.year,now.month,now.day,23,0,0)
+                                if (self.timeofday%100)>=30: #morning
+                                    start = datetime.datetime(now.year,now.month,now.day,7,0,0)
+                                trange = (start,end)
+                            if trange[0]>=self.deadline:
+                                return False
+                            timeslot=datetime.datetime(2999,1,1,0,0,0)
+                            while timeslot>=self.deadline:
+                                timeslot,err = self.calendar.propose(ntoday,tmin=trange[0],tmax=trange[1])
+                            self.reminders[kweek].append(self.reminder(timeslot))
+                            if progressbar:
+                                progressbar.step(proginc)
+                            nsofar+=1
         elif not thisweek: #Go through week by week from the start time and add an  number of reminders
             if self.frequency>=1:
                 ndays = int((self.deadline-self.firstday).total_seconds()/86400.0)
@@ -126,6 +335,7 @@ class Task:
                     elif day.weekday <=4 and self.timeframe%10==0:
                         pass
                     else:
+                        kweek = self.calendar.whatweekisit(day)
                         nsofar = 0
                         while nsofar<self.frequency:
                             if (self.timeofday%2)==0: #Not during the day
@@ -153,14 +363,17 @@ class Task:
                                 if (self.timeofday%100)>=30: #morning
                                     start = datetime.datetime(day.year,day.month,day.day,7,0,0)
                                 trange = (start,end)
-                            
+                            if progressbar:
+                                progressbar.step(0.5*proginc/(ndays*self.frequency))
                             if trange[0]>=self.deadline:
                                 break
                             timeslot=datetime.datetime(2999,1,1,0,0,0)
                             while timeslot>=self.deadline:
                                 timeslot,err = self.calendar.propose(n,tmin=trange[0],tmax=trange[1])
                             
-                            self.reminders.append(self.reminder(timeslot))
+                            self.reminders[kweek].append(self.reminder(timeslot))
+                            if progressbar:
+                                progressbar.step(0.5*proginc/(ndays*self.frequency))
                             nsofar+=1
                             if self.frequency-nsofar<1:
                                 flip=random.random()
@@ -232,18 +445,23 @@ class Task:
                             if trange[0]>=self.deadline:
                                 break
                             timeslot=datetime.datetime(2999,1,1,0,0,0)
+                            if progressbar:
+                                progressbar.step(0.5*proginc/(self.fperweek*len(self.calendar.weeks)))
                             while timeslot>=self.deadline:
                                 timeslot,err = self.calendar.propose(day[-1],trange[0],trange[1])
                             if not err:
-                                self.reminders.append(self.reminder(timeslot))
+                                self.reminders[k].append(self.reminder(timeslot))
                                 nsofar+=1
                             else:
                                 nerr+=1
                                 errs.append(timeslot)
                                 if (nsofar+nerr)>=len(week):
                                     for ts in errs:
-                                        self.reminders.append(self.reminder(ts))
+                                        self.reminders[k].append(self.reminder(ts))
                                         nsofar+=1
+                            
+                            if progressbar:
+                                progressbar.step(0.5*proginc/(self.fperweek*len(self.calendar.weeks)))
                             if self.fperweek-nsofar<1:
                                 flip=random.random()
                                 if flip>self.fperweek-nsofar:
@@ -330,6 +548,18 @@ class Calendar: #Almost a wrapper for the Schedule class--basically a collection
         
     def whatdayisit(self,today):
         return int((today-self.dayi).total_seconds()/86400.0)
+        
+    def whatweekisit(self,today):
+        lwk1 = 7 - min(7-self.days[0][1],len(self.days)) #e.g. if we start on Sat, +5 means day 3 is a new week
+        return int(((today-self.dayi).total_seconds()/86400.0 + lwk1)/7)
+        
+    def daysleftinweek(self,today,weekend=True):
+        kweek = self.whatweekisit(today)
+        daytyp = today.weekday()
+        if weekend:
+            return (min(self.weeks[kweek][-1][1],6)-daytyp+1) #Sunday is last day of the week
+        else:
+            return (min(self.weeks[kweek][-1][1],4)-daytyp+1) #Friday is last day of the week
         
     def propose(self,nday,tmin=None,tmax=None):
         ut,lt,err = self.days[nday][2].proposetime(tmin=tmin-self.dtz,tmax=tmax-self.dtz)
